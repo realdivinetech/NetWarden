@@ -19,6 +19,7 @@ import (
 	"github.com/amdzy/NetWarden/internal/defense"
 	"github.com/amdzy/NetWarden/internal/device"
 	"github.com/amdzy/NetWarden/internal/discovery"
+	"github.com/amdzy/NetWarden/internal/domains"
 	"github.com/amdzy/NetWarden/internal/history"
 	"github.com/amdzy/NetWarden/internal/metadata"
 	networkgateway "github.com/amdzy/NetWarden/internal/network/gateway"
@@ -32,6 +33,14 @@ type GUIApp struct {
 	cancel     context.CancelFunc
 	activity   []ActivityDTO
 	logger     *slog.Logger
+
+	authMu          sync.RWMutex
+	authorized      bool
+	authVerified    bool
+	servicesStarted bool
+
+	scheduleMu     sync.Mutex
+	scheduleEngine *scheduleEngine
 
 	bandwidthHealthMu sync.Mutex
 	bandwidthHealth   bandwidthHealthState
@@ -99,17 +108,26 @@ type IPv6RouterIdentityDTO struct {
 }
 
 type DeviceDTO struct {
-	IP           string    `json:"ip"`
-	Addresses    []string  `json:"addresses"`
-	MAC          string    `json:"mac"`
-	Name         string    `json:"name"`
-	Vendor       string    `json:"vendor"`
-	Type         string    `json:"type"`
-	Role         string    `json:"role"`
-	FirstSeen    time.Time `json:"firstSeen"`
-	LastSeen     time.Time `json:"lastSeen"`
-	Online       bool      `json:"online"`
-	ControlState string    `json:"controlState"`
+	IP           string      `json:"ip"`
+	Addresses    []string    `json:"addresses"`
+	MAC          string      `json:"mac"`
+	Name         string      `json:"name"`
+	Vendor       string      `json:"vendor"`
+	Type         string      `json:"type"`
+	Role         string      `json:"role"`
+	FirstSeen    time.Time   `json:"firstSeen"`
+	LastSeen     time.Time   `json:"lastSeen"`
+	Online       bool        `json:"online"`
+	ControlState string      `json:"controlState"`
+	Domains      []DomainDTO `json:"domains"`
+}
+
+type DomainDTO struct {
+	Domain   string    `json:"domain"`
+	Kind     string    `json:"kind"`
+	Platform string    `json:"platform,omitempty"`
+	Remote   string    `json:"remote,omitempty"`
+	LastSeen time.Time `json:"lastSeen"`
 }
 
 type ConflictDTO struct {
@@ -160,16 +178,20 @@ func (a *GUIApp) startup(ctx context.Context) {
 			a.log(slog.LevelError, "frontend error", "component", "frontend", "detail", fmt.Sprint(optionalData[0]))
 		}
 	})
+	// The gateway authorization gate holds back the schedule engine and the
+	// automatic capture session. Both start only once a stored authorization
+	// record validates against this network's gateway; otherwise the frontend
+	// gate runs AuthorizeGateway first.
 	_, config, err := loadSettings()
-	if err != nil || !config.AutoStart || config.Interface == "" {
+	if err != nil {
+		a.log(slog.LevelError, "settings unavailable at startup", "component", "lifecycle", "error", err)
 		return
 	}
-	go func() {
-		if err := a.StartMonitoring(config.Interface); err != nil {
-			a.recordActivity(ActivityDTO{At: time.Now().UTC(), Kind: "error", Severity: "error", Title: "Automatic monitoring failed", Detail: err.Error()})
-			runtime.EventsEmit(a.ctx, "runtime:error", err.Error())
-		}
-	}()
+	if !a.applyStoredAuthorization(config) {
+		a.log(slog.LevelInfo, "gateway authorization is required", "component", "lifecycle")
+		return
+	}
+	a.startAuthorizedServices(config)
 }
 
 func (a *GUIApp) shutdown(context.Context) {
@@ -286,6 +308,9 @@ func (a *GUIApp) StartMonitoring(interfaceName string) (resultErr error) {
 			a.log(slog.LevelError, "monitoring failed", "component", "lifecycle", "interface", interfaceName, "error", resultErr)
 		}
 	}()
+	if err := a.requireAuthorized(); err != nil {
+		return err
+	}
 	a.mu.Lock()
 	if a.cancel != nil {
 		a.mu.Unlock()
@@ -501,6 +526,9 @@ func (a *GUIApp) Devices() ([]DeviceDTO, error) {
 			} else {
 				item.ControlState = "active"
 			}
+		}
+		if supervisor != nil && supervisor.Current() != nil {
+			item.Domains = domainDTOs(supervisor.DeviceDomains(current.MAC))
 		}
 		result = append(result, item)
 	}
@@ -754,6 +782,9 @@ func (a *GUIApp) requireStopped(action string) error {
 }
 
 func (a *GUIApp) activeSupervisor() (*coreapp.Supervisor, error) {
+	if err := a.requireAuthorized(); err != nil {
+		return nil, err
+	}
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	if a.supervisor == nil {
@@ -783,7 +814,9 @@ func (a *GUIApp) forwardEvents(ctx context.Context, supervisor *coreapp.Supervis
 			}
 		case event := <-supervisor.Events():
 			activity := activityFromEvent(event)
-			a.recordActivity(activity)
+			if event.Kind != coreapp.EventDeviceDomainsObserved {
+				a.recordActivity(activity)
+			}
 			runtime.EventsEmit(a.ctx, "network:event", activity)
 			if !baselineComplete {
 				switch event.Kind {
@@ -1009,6 +1042,8 @@ func activityFromEvent(event coreapp.Event) ActivityDTO {
 		activity.Kind, activity.Severity, activity.Title = "control", "error", "Control audit failed"
 	case coreapp.EventBandwidthMonitoringFailed:
 		activity.Kind, activity.Severity, activity.Title = "bandwidth", "error", "Bandwidth monitor route update failed"
+	case coreapp.EventDeviceDomainsObserved:
+		activity.Kind, activity.Title = "device", "Domains updated"
 	}
 	if event.Device != nil {
 		parts := make([]string, 0, 3)
@@ -1085,6 +1120,21 @@ func clearStoredInterface() error {
 func storedMAC(value string) net.HardwareAddr {
 	mac, _ := net.ParseMAC(value)
 	return mac
+}
+
+func domainDTOs(entries []domains.Entry) []DomainDTO {
+	if len(entries) == 0 {
+		return nil
+	}
+	result := make([]DomainDTO, 0, len(entries))
+	for _, entry := range entries {
+		item := DomainDTO{Domain: entry.Domain, Kind: entry.Kind.String(), Platform: entry.Platform, LastSeen: entry.LastSeen}
+		if entry.Remote.IsValid() {
+			item.Remote = entry.Remote.String()
+		}
+		result = append(result, item)
+	}
+	return result
 }
 
 func deviceDTO(value device.Device) DeviceDTO {
