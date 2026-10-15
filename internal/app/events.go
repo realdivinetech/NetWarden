@@ -39,6 +39,8 @@ const (
 	EventControlContinuousWorkerStopped
 	EventControlAuditFailed
 	EventBandwidthMonitoringFailed
+	EventDeviceDomainsObserved
+	EventDomainBlockChanged
 )
 
 type ControlState string

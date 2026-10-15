@@ -349,6 +349,21 @@ func (s *BandwidthService) Contains(mac net.HardwareAddr) bool {
 	return found
 }
 
+// Limited reports whether the device currently has an active bandwidth policy.
+func (s *BandwidthService) Limited(mac net.HardwareAddr) bool {
+	if s == nil {
+		return false
+	}
+	key, err := bandwidthMACKey(mac)
+	if err != nil {
+		return false
+	}
+	s.mu.RLock()
+	_, found := s.active[key]
+	s.mu.RUnlock()
+	return found
+}
+
 func (s *BandwidthService) resolve(target ControlTarget) (BandwidthTarget, error) {
 	key, err := bandwidthMACKey(target.MAC)
 	if err != nil || !target.IP.IsValid() {

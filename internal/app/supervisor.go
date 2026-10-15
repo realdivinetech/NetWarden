@@ -9,6 +9,7 @@ import (
 
 	"github.com/amdzy/NetWarden/internal/defense"
 	"github.com/amdzy/NetWarden/internal/device"
+	"github.com/amdzy/NetWarden/internal/domains"
 )
 
 type RuntimeFactory func(context.Context) (*Runtime, error)
@@ -149,6 +150,13 @@ func (s *Supervisor) Devices() []device.Device {
 func (s *Supervisor) ConflictHistory() []defense.Conflict {
 	if runtime := s.Current(); runtime != nil {
 		return runtime.ConflictHistory()
+	}
+	return nil
+}
+
+func (s *Supervisor) DeviceDomains(mac string) []domains.Entry {
+	if runtime := s.Current(); runtime != nil {
+		return runtime.DeviceDomains(mac)
 	}
 	return nil
 }

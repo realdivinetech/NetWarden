@@ -4,6 +4,8 @@ package capture
 import (
 	"context"
 	"time"
+
+	"github.com/amdzy/NetWarden/internal/packet"
 )
 
 // Frame is copied packet data with the time at which it was observed.
@@ -27,4 +29,11 @@ type Driver interface {
 type BorrowedFrameDriver interface {
 	Driver
 	RunBorrowed(context.Context, func(Frame) error) error
+}
+
+// DomainSource is implemented by capture drivers that surface passive Layer 7
+// domain metadata parsed inside the privileged helper. The handler receives
+// canonical observations only; packet payloads never cross this boundary.
+type DomainSource interface {
+	SetDomainHandler(func([]packet.Observation))
 }

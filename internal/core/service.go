@@ -50,10 +50,35 @@ type NDPObserver interface {
 	Observe(packet.NDP, time.Time)
 }
 
+// DomainObserver receives passive Layer 7 domain metadata attributed to on-link
+// devices. Implementations must not block; observations carry no payloads.
+type DomainObserver interface {
+	ObserveDomains([]packet.Observation)
+}
+
 type Option func(*Service)
 
 func WithEnricher(enricher Enricher) Option {
 	return func(service *Service) { service.enricher = enricher }
+}
+
+func WithDomainObserver(observer DomainObserver) Option {
+	return func(service *Service) {
+		if observer != nil {
+			service.domainObservers = append(service.domainObservers, observer)
+		}
+	}
+}
+
+// WithOnLink supplies the predicate that decides whether an address belongs to
+// the selected local network. Without it, application metadata cannot be
+// attributed to a device and is discarded.
+func WithOnLink(predicate func(netip.Addr) bool) Option {
+	return func(service *Service) {
+		if predicate != nil {
+			service.onLink = predicate
+		}
+	}
 }
 
 func WithARPObserver(observer ARPObserver) Option {
@@ -99,6 +124,8 @@ type Service struct {
 	enricher             Enricher
 	observers            []ARPObserver
 	ndpObservers         []NDPObserver
+	domainObservers      []DomainObserver
+	onLink               func(netip.Addr) bool
 	ignoredSenderMAC     string
 	dropped              atomic.Uint64
 
@@ -177,6 +204,13 @@ func (s *Service) Run(ctx context.Context) error {
 func (s *Service) Close() error { return s.driver.Close() }
 
 func (s *Service) handleFrame(frame capture.Frame) error {
+	if len(s.domainObservers) > 0 {
+		if observations := packet.InspectApplication(frame.Data, s.onLink); len(observations) > 0 {
+			for _, observer := range s.domainObservers {
+				observer.ObserveDomains(observations)
+			}
+		}
+	}
 	message, err := packet.ParseARP(frame.Data)
 	seenAt := frame.CapturedAt
 	if seenAt.IsZero() {

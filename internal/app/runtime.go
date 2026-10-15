@@ -19,6 +19,7 @@ import (
 	"github.com/amdzy/NetWarden/internal/defense"
 	"github.com/amdzy/NetWarden/internal/device"
 	"github.com/amdzy/NetWarden/internal/discovery"
+	"github.com/amdzy/NetWarden/internal/domains"
 	"github.com/amdzy/NetWarden/internal/history"
 	"github.com/amdzy/NetWarden/internal/network"
 	networkgateway "github.com/amdzy/NetWarden/internal/network/gateway"
@@ -124,6 +125,8 @@ type Status struct {
 	ActiveBandwidthLimits        int
 	BandwidthMonitoringAvailable bool
 	ActiveBandwidthMonitors      int
+	DomainBlockAvailable         bool
+	ActiveDomainBlocks           int
 	IPv6Available                bool
 	IPv6RouterIP                 string
 	IPv6RouterMAC                string
@@ -146,6 +149,7 @@ type Runtime struct {
 	events   chan Event
 	gateway  networkgateway.Discoverer
 	route    networkgateway.Route
+	domains  *domains.Registry
 
 	mu         sync.Mutex
 	cancel     context.CancelFunc
@@ -158,6 +162,7 @@ type Runtime struct {
 	doneOnce   sync.Once
 	control    *ControlLifecycle
 	bandwidth  *BandwidthService
+	blocks     *DomainBlockService
 	traffic    *trafficmetrics.Monitor
 }
 
@@ -165,7 +170,7 @@ func DefaultDependencies() Dependencies {
 	return Dependencies{
 		Gateway: networkgateway.SystemDiscoverer{},
 		Open: func(name string) (capture.Driver, error) {
-			return pcapdriver.Open(name, pcapdriver.Config{Promiscuous: true, Filter: "arp or icmp6"})
+			return pcapdriver.Open(name, pcapdriver.Config{Promiscuous: true, Filter: "arp or icmp6 or udp port 53 or tcp port 443"})
 		},
 		Resolve: discovery.ResolveARP,
 	}
@@ -258,7 +263,18 @@ func Bootstrap(ctx context.Context, dependencies Dependencies, config Config) (*
 	}
 	ipv6 := discovery.NewIPv6RouterTracker(localIPv6)
 	ipv6.RestoreState(durableHistory.IPv6Routers)
-	options := []core.Option{core.WithARPObserver(monitor), core.WithNDPObserver(ipv6), core.WithRemovalAfter(config.DeviceRetention), core.WithIPv6AddressRetention(config.IPv6AddressRetention), core.WithIgnoredSenderMAC(config.Interface.MAC)}
+	domainRegistry := domains.NewRegistry(domains.DefaultMaxEntries, domains.DefaultTTL)
+	domainRecorder := &domainObserver{registry: domainRegistry}
+	onLink := func(address netip.Addr) bool {
+		address = address.Unmap()
+		for _, candidate := range config.Interface.Prefixes {
+			if candidate.IsValid() && candidate.Contains(address) {
+				return true
+			}
+		}
+		return false
+	}
+	options := []core.Option{core.WithARPObserver(monitor), core.WithNDPObserver(ipv6), core.WithRemovalAfter(config.DeviceRetention), core.WithIPv6AddressRetention(config.IPv6AddressRetention), core.WithIgnoredSenderMAC(config.Interface.MAC), core.WithDomainObserver(domainRecorder), core.WithOnLink(onLink)}
 	if dependencies.Metadata != nil {
 		options = append(options, core.WithEnricher(dependencies.Metadata))
 	} else if dependencies.Enricher != nil {
@@ -276,18 +292,28 @@ func Bootstrap(ctx context.Context, dependencies Dependencies, config Config) (*
 		metadata: dependencies.Metadata, settings: dependencies.Settings,
 		events: make(chan Event, 128), gateway: dependencies.Gateway, route: route,
 		history: dependencies.History, persist: make(chan struct{}, 1),
-		done: make(chan struct{}),
+		done: make(chan struct{}), domains: domainRegistry,
+	}
+	domainRecorder.setPublish(runtime.publishDomains)
+	if source, ok := driver.(capture.DomainSource); ok {
+		source.SetDomainHandler(domainRecorder.ObserveDomains)
 	}
 	runtime.control = NewControlLifecycle(runtime.publish)
 	controller, _ := driver.(BandwidthController)
-	runtime.bandwidth = NewBandwidthService(controller, registry, func(mac net.HardwareAddr) bool {
+	disconnectActive := func(mac net.HardwareAddr) bool {
 		for _, target := range runtime.control.Snapshot() {
 			if target.MAC.String() == mac.String() {
 				return true
 			}
 		}
 		return false
-	})
+	}
+	runtime.bandwidth = NewBandwidthService(controller, registry, disconnectActive)
+	blockController, _ := driver.(DomainBlockController)
+	runtime.blocks = NewDomainBlockService(blockController, runtime.bandwidth, registry, disconnectActive)
+	if dependencies.Settings != nil {
+		runtime.blocks.SetConfiguredSource(settingsBlockSource{store: dependencies.Settings})
+	}
 	runtime.traffic = trafficmetrics.NewMonitor(runtime.bandwidth, time.Second, time.Hour)
 	runtime.traffic.RestoreState(durableHistory.Traffic, now)
 	if source, ok := ipv6DiscoverySource(localIPv6); ok {
@@ -394,6 +420,7 @@ func (r *Runtime) Status() Status {
 		ActiveControlTargets: len(r.control.Snapshot()), ContinuousControl: r.control.ContinuousRunning(),
 		BandwidthAvailable: r.bandwidth.Available(), ActiveBandwidthLimits: len(r.bandwidth.Snapshot()),
 		BandwidthMonitoringAvailable: r.bandwidth.MonitoringAvailable(), ActiveBandwidthMonitors: len(r.bandwidth.MonitoringSnapshot()),
+		DomainBlockAvailable: r.blocks.Available(), ActiveDomainBlocks: len(r.blocks.Snapshot()),
 		IPv6Available: len(ipv6.LocalAddresses) > 0,
 	}
 	status.IPv6RouterConflicts = ipv6.ConflictCount
@@ -434,6 +461,48 @@ func (r *Runtime) RemoveBandwidthLimit(ctx context.Context, mac net.HardwareAddr
 }
 
 func (r *Runtime) ClearBandwidthLimits(ctx context.Context) error { return r.bandwidth.Clear(ctx) }
+
+func (r *Runtime) DomainBlocks() []DomainBlockTarget { return r.blocks.Snapshot() }
+
+func (r *Runtime) SetDomainBlock(ctx context.Context, target ControlTarget, domains []string) error {
+	if err := r.blocks.Set(ctx, target, domains); err != nil {
+		return err
+	}
+	r.publish(Event{Kind: EventDomainBlockChanged, Device: r.deviceFor(target.MAC)})
+	return nil
+}
+
+func (r *Runtime) RemoveDomainBlock(ctx context.Context, mac net.HardwareAddr) error {
+	if err := r.blocks.Remove(ctx, mac); err != nil {
+		return err
+	}
+	r.publish(Event{Kind: EventDomainBlockChanged, Device: r.deviceFor(mac)})
+	return nil
+}
+
+func (r *Runtime) ClearDomainBlocks(ctx context.Context) error {
+	if err := r.blocks.Clear(ctx); err != nil {
+		return err
+	}
+	r.publish(Event{Kind: EventDomainBlockChanged})
+	return nil
+}
+
+// DeviceBlockedDomains returns the deny list currently installed for a device.
+func (r *Runtime) DeviceBlockedDomains(mac string) []string {
+	parsed, err := net.ParseMAC(mac)
+	if err != nil {
+		return nil
+	}
+	return r.blocks.Domains(parsed)
+}
+
+func (r *Runtime) deviceFor(mac net.HardwareAddr) *device.Device {
+	if current, ok := r.registry.Get(mac.String()); ok {
+		return &current
+	}
+	return nil
+}
 
 func (r *Runtime) StartBandwidthMonitor(ctx context.Context, target ControlTarget) error {
 	if err := r.bandwidth.StartMonitoring(ctx, target); err != nil {
@@ -637,6 +706,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	controlErr := r.control.RestoreAll(controlCtx, "runtime shutdown or network change")
 	cancelControl()
 	bandwidthCtx, cancelBandwidth := context.WithTimeout(context.Background(), 5*time.Second)
+	blockErr := r.blocks.Clear(bandwidthCtx)
 	bandwidthErr := r.bandwidth.Clear(bandwidthCtx)
 	monitorErr := r.bandwidth.ClearMonitoring(bandwidthCtx)
 	cancelBandwidth()
@@ -650,7 +720,7 @@ func (r *Runtime) Run(ctx context.Context) error {
 	r.stopped = true
 	r.cancel = nil
 	r.mu.Unlock()
-	result := errors.Join(first, stageError(StageShutdown, controlErr), stageError(StageShutdown, bandwidthErr), stageError(StageShutdown, monitorErr), stageError(StageShutdown, closeErr))
+	result := errors.Join(first, stageError(StageShutdown, controlErr), stageError(StageShutdown, blockErr), stageError(StageShutdown, bandwidthErr), stageError(StageShutdown, monitorErr), stageError(StageShutdown, closeErr))
 	r.publish(Event{Kind: EventRuntimeStopped, Err: result})
 	return result
 }
@@ -663,7 +733,14 @@ func (r *Runtime) forwardEvents(ctx context.Context) {
 		case event := <-r.service.Events():
 			if event.Kind == core.EventAddressChanged {
 				reconcileCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-				err := errors.Join(r.bandwidth.ReconcileDevice(reconcileCtx, event.Device), r.control.ReconcileDevice(reconcileCtx, event.Device))
+				err := errors.Join(r.bandwidth.ReconcileDevice(reconcileCtx, event.Device), r.control.ReconcileDevice(reconcileCtx, event.Device), r.blocks.ReconcileDevice(reconcileCtx, event.Device))
+				cancel()
+				if err != nil {
+					r.publish(Event{Kind: EventBandwidthMonitoringFailed, Device: &event.Device, Err: err})
+				}
+			} else if event.Kind == core.EventObserved || event.Kind == core.EventReturnedOnline {
+				reconcileCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				err := r.blocks.ReconcileDevice(reconcileCtx, event.Device)
 				cancel()
 				if err != nil {
 					r.publish(Event{Kind: EventBandwidthMonitoringFailed, Device: &event.Device, Err: err})
@@ -793,10 +870,29 @@ func (r *Runtime) Close() error {
 	controlErr := r.control.RestoreAll(controlCtx, "runtime closed")
 	cancelControl()
 	bandwidthCtx, cancelBandwidth := context.WithTimeout(context.Background(), 5*time.Second)
+	blockErr := r.blocks.Clear(bandwidthCtx)
 	bandwidthErr := r.bandwidth.Clear(bandwidthCtx)
 	monitorErr := r.bandwidth.ClearMonitoring(bandwidthCtx)
 	cancelBandwidth()
-	return errors.Join(controlErr, bandwidthErr, monitorErr, r.driver.Close())
+	return errors.Join(controlErr, blockErr, bandwidthErr, monitorErr, r.driver.Close())
+}
+
+// settingsBlockSource adapts the settings store to the ConfiguredBlockSource
+// interface used to persist per-device deny lists.
+type settingsBlockSource struct{ store *appconfig.Store }
+
+func (s settingsBlockSource) ConfiguredBlockedDomains(mac net.HardwareAddr) ([]string, error) {
+	return s.store.ConfiguredBlockedDomains(mac)
+}
+
+func (s settingsBlockSource) SetDomainBlocks(mac net.HardwareAddr, domains []string) error {
+	_, err := s.store.SetDomainBlocks(mac, domains)
+	return err
+}
+
+func (s settingsBlockSource) RemoveDomainBlocks(mac net.HardwareAddr) error {
+	_, err := s.store.RemoveDomainBlocks(mac)
+	return err
 }
 
 func prefixForRoute(prefixes []netip.Prefix, route networkgateway.Route) (netip.Prefix, error) {
