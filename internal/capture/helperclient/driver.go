@@ -19,23 +19,29 @@ import (
 
 	"github.com/amdzy/NetWarden/internal/capture"
 	"github.com/amdzy/NetWarden/internal/capture/helper"
+	"github.com/amdzy/NetWarden/internal/packet"
 	"github.com/amdzy/NetWarden/internal/shaping"
 )
 
 type Driver struct {
-	command *exec.Cmd
-	input   io.WriteCloser
-	output  io.Closer
-	wait    <-chan error
-	done    chan struct{}
-	frames  chan capture.Frame
-	errors  chan error
-	mu      sync.Mutex
-	closed  bool
-	stop    sync.Once
-	pending map[string]chan helperResponse
-	nextID  atomic.Uint64
+	command       *exec.Cmd
+	input         io.WriteCloser
+	output        io.Closer
+	wait          <-chan error
+	done          chan struct{}
+	frames        chan capture.Frame
+	errors        chan error
+	mu            sync.Mutex
+	closed        bool
+	stop          sync.Once
+	pending       map[string]chan helperResponse
+	nextID        atomic.Uint64
+	domainMu      sync.RWMutex
+	domainHandler func([]packet.Observation)
 }
+
+var _ capture.Driver = (*Driver)(nil)
+var _ capture.DomainSource = (*Driver)(nil)
 
 type helperResponse struct {
 	message helper.Message
@@ -169,6 +175,16 @@ func (d *Driver) read(decoder *json.Decoder) {
 			case <-d.done:
 				return
 			}
+		case "domains":
+			if len(message.Observations) == 0 {
+				continue
+			}
+			d.domainMu.RLock()
+			handler := d.domainHandler
+			d.domainMu.RUnlock()
+			if handler != nil {
+				handler(message.Observations)
+			}
 		case "error":
 			d.report(errors.New(message.Error))
 		case "result":
@@ -185,6 +201,14 @@ func (d *Driver) read(decoder *json.Decoder) {
 			}
 		}
 	}
+}
+
+// SetDomainHandler installs the callback for passive Layer 7 metadata reported
+// by the privileged helper. Only metadata is delivered, never payloads.
+func (d *Driver) SetDomainHandler(handler func([]packet.Observation)) {
+	d.domainMu.Lock()
+	d.domainHandler = handler
+	d.domainMu.Unlock()
 }
 
 // SetBandwidthLimit installs a validated policy in the privileged helper.
@@ -236,6 +260,19 @@ func (d *Driver) SetDeviceIsolation(ctx context.Context, addresses []netip.Addr,
 
 func (d *Driver) RestoreDevice(ctx context.Context, addresses []netip.Addr, mac net.HardwareAddr) error {
 	_, err := d.request(ctx, helper.Message{Type: "isolate_remove", TargetIPs: addressStrings(addresses), TargetMAC: mac.String()})
+	return err
+}
+
+// SetDeviceBlock installs a per-device domain block list in the privileged
+// helper. Only hostnames cross the process boundary; payloads never leave it.
+func (d *Driver) SetDeviceBlock(ctx context.Context, addresses []netip.Addr, mac net.HardwareAddr, domains []string) error {
+	_, err := d.request(ctx, helper.Message{Type: "block_set", TargetIPs: addressStrings(addresses), TargetMAC: mac.String(), BlockedDomains: domains})
+	return err
+}
+
+// RemoveDeviceBlock clears a device's domain block list in the privileged helper.
+func (d *Driver) RemoveDeviceBlock(ctx context.Context, mac net.HardwareAddr) error {
+	_, err := d.request(ctx, helper.Message{Type: "block_remove", TargetMAC: mac.String()})
 	return err
 }
 

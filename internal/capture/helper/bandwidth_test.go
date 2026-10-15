@@ -347,6 +347,73 @@ func TestBandwidthSessionStaleRefreshCannotRedirectStoppedMonitor(t *testing.T) 
 	}
 }
 
+func TestBandwidthSessionSkipsUnverifiedIPv6AndMonitorsIPv4(t *testing.T) {
+	local := mustHelperMAC(t, "02:00:00:00:00:10")
+	gateway := mustHelperMAC(t, "02:00:00:00:00:01")
+	device := mustHelperMAC(t, "02:00:00:00:00:20")
+	device4, device6 := netip.MustParseAddr("192.168.1.20"), netip.MustParseAddr("2001:db8:1::20")
+	recorder := &bandwidthRecorder{sent: make(chan []byte, 16)}
+	session, err := newBandwidthSession(context.Background(), local, netip.MustParseAddr("192.168.1.10"), netip.MustParseAddr("192.168.1.1"), netip.MustParsePrefix("192.168.1.10/24"), recorder.send)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = session.close() })
+	session.observeGateway(gateway)
+	// No NDP is observed, so the IPv6 local/router identities stay unverified.
+	if err := session.monitorRoutes(context.Background(), []netip.Addr{device4, device6}, device); err != nil {
+		t.Fatalf("monitoring should fall back to the verified IPv4 path: %v", err)
+	}
+	for range 2 {
+		frame := receiveBandwidthFrame(t, recorder.sent)
+		if _, err := packet.ParseNDP(frame); err == nil {
+			t.Fatalf("unverified IPv6 address was still redirected: %x", frame)
+		}
+	}
+	select {
+	case frame := <-recorder.sent:
+		t.Fatalf("unexpected extra frame, the IPv6 address was not skipped: %x", frame)
+	default:
+	}
+	if err := session.setRoutes(context.Background(), []netip.Addr{device4, device6}, device, shaping.Policy{UploadBitsPerSecond: 1_000_000}); err != nil {
+		t.Fatalf("limiting should fall back to the verified IPv4 path: %v", err)
+	}
+	for range 2 {
+		receiveBandwidthFrame(t, recorder.sent)
+	}
+	if err := session.removeRoutes(context.Background(), []netip.Addr{device4, device6}, device); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBandwidthSessionIsolatesIPv4WhenIPv6Unverified(t *testing.T) {
+	local := mustHelperMAC(t, "02:00:00:00:00:10")
+	gateway := mustHelperMAC(t, "02:00:00:00:00:01")
+	device := mustHelperMAC(t, "02:00:00:00:00:20")
+	device4, device6 := netip.MustParseAddr("192.168.1.20"), netip.MustParseAddr("2001:db8:1::20")
+	recorder := &bandwidthRecorder{sent: make(chan []byte, 16)}
+	session, err := newBandwidthSession(context.Background(), local, netip.MustParseAddr("192.168.1.10"), netip.MustParseAddr("192.168.1.1"), netip.MustParsePrefix("192.168.1.10/24"), recorder.send)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = session.close() })
+	session.observeGateway(gateway)
+	// No NDP is observed, so the IPv6 local/router identities stay unverified.
+	if err := session.isolateRoutes(context.Background(), []netip.Addr{device4, device6}, device, true); err != nil {
+		t.Fatalf("isolation should fall back to the verified IPv4 path: %v", err)
+	}
+	receiveBandwidthFrame(t, recorder.sent)
+	receiveBandwidthFrame(t, recorder.sent)
+	if !session.dropIsolated(helperIPv4Frame(local, device, device4, netip.MustParseAddr("1.1.1.1"))) {
+		t.Fatal("isolated IPv4 upload was not dropped")
+	}
+	if session.dropIsolated(helperIPv6Frame(local, device, device6, netip.MustParseAddr("2001:4860:4860::8888"))) {
+		t.Fatal("unverified IPv6 address was isolated anyway")
+	}
+	if err := session.restoreIsolation(context.Background(), []netip.Addr{device4, device6}, device); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func assertARPIdentity(t *testing.T, frame []byte, senderIP netip.Addr, senderMAC net.HardwareAddr, targetIP netip.Addr, targetMAC net.HardwareAddr) {
 	t.Helper()
 	message, err := packet.ParseARP(frame)

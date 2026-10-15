@@ -17,6 +17,12 @@ import (
 
 const bandwidthRefreshInterval = time.Second
 
+// errIPv6Unverified marks a target address that cannot be redirected because
+// the local and router IPv6 identities have not been learned from live NDP
+// traffic yet. Callers treat it as a skip rather than a hard failure so an
+// IPv4-only path can still be installed on a dual-stack network.
+var errIPv6Unverified = errors.New("verified IPv6 local and router identities are required")
+
 type bandwidthTarget struct {
 	ip         netip.Addr
 	addresses  []netip.Addr
@@ -38,6 +44,7 @@ type bandwidthSession struct {
 	localIP   netip.Addr
 	gatewayIP netip.Addr
 	prefix    netip.Prefix
+	onLink    func(netip.Addr) bool
 	send      frameSenderFunc
 	manager   *shaping.Manager
 	forwarder *shaping.Forwarder
@@ -50,6 +57,7 @@ type bandwidthSession struct {
 	routerIPv6MAC   net.HardwareAddr
 	targets         map[string]bandwidthTarget
 	isolated        map[string]bandwidthTarget
+	blocked         map[string]*blockTarget
 	isolationActive atomic.Bool
 	cancel          context.CancelFunc
 	done            chan error
@@ -91,7 +99,7 @@ func (s *bandwidthSession) setRoutes(ctx context.Context, addresses []netip.Addr
 	if len(addresses) == 0 {
 		return errors.New("bandwidth target requires at least one address")
 	}
-	if err := s.set(ctx, addresses[0], mac, policy); err != nil {
+	if err := s.set(ctx, s.primaryAddress(addresses, mac), mac, policy); err != nil {
 		return err
 	}
 	return s.replaceRoutes(ctx, mac, addresses)
@@ -102,10 +110,23 @@ func (s *bandwidthSession) monitorRoutes(ctx context.Context, addresses []netip.
 	if len(addresses) == 0 {
 		return errors.New("bandwidth target requires at least one address")
 	}
-	if err := s.monitor(ctx, addresses[0], mac); err != nil {
+	if err := s.monitor(ctx, s.primaryAddress(addresses, mac), mac); err != nil {
 		return err
 	}
 	return s.replaceRoutes(ctx, mac, addresses)
+}
+
+// primaryAddress picks the first target address that can be redirected right
+// now, so an unverifiable IPv6 address never blocks an otherwise-eligible IPv4
+// path. It falls back to the first address so the caller surfaces the real
+// validation error when nothing at all is eligible.
+func (s *bandwidthSession) primaryAddress(addresses []netip.Addr, mac net.HardwareAddr) netip.Addr {
+	for _, address := range addresses {
+		if s.validateTarget(address, mac) == nil {
+			return address
+		}
+	}
+	return addresses[0]
 }
 
 func (s *bandwidthSession) replaceRoutes(ctx context.Context, mac net.HardwareAddr, addresses []netip.Addr) error {
@@ -137,6 +158,13 @@ func (s *bandwidthSession) replaceRoutes(ctx context.Context, mac net.HardwareAd
 			continue
 		}
 		if err := s.validateTarget(address, mac); err != nil {
+			if errors.Is(err, errIPv6Unverified) {
+				// Skip IPv6 addresses whose local/router identities have not
+				// been learned from live NDP traffic yet. The IPv4 (and any
+				// verified IPv6) path still operates; drop any stale route.
+				s.forwarder.RemoveRoute(address)
+				continue
+			}
 			s.rollbackRouteChange(target, installed[1:], removed)
 			return err
 		}
@@ -145,13 +173,12 @@ func (s *bandwidthSession) replaceRoutes(ctx context.Context, mac net.HardwareAd
 			return err
 		}
 		installed = append(installed, address)
-		target.addresses = append(target.addresses, address)
 		if err := s.redirectAddress(ctx, target, address); err != nil {
 			s.rollbackRouteChange(target, installed[1:], removed)
 			return fmt.Errorf("redirect %s: %w", address, err)
 		}
 	}
-	target.addresses = append([]netip.Addr(nil), addresses...)
+	target.addresses = installed
 	s.mu.Lock()
 	s.targets[key] = target
 	s.mu.Unlock()
@@ -199,9 +226,9 @@ func newBandwidthSession(ctx context.Context, localMAC net.HardwareAddr, localIP
 	runCtx, cancel := context.WithCancel(ctx)
 	session := &bandwidthSession{
 		localMAC: append(net.HardwareAddr(nil), localMAC...), localIP: localIP, gatewayIP: gatewayIP,
-		prefix: prefix, send: send, manager: manager, forwarder: forwarder,
+		prefix: prefix, onLink: func(netip.Addr) bool { return false }, send: send, manager: manager, forwarder: forwarder,
 		targets: make(map[string]bandwidthTarget), cancel: cancel, done: make(chan error, 1),
-		isolated: make(map[string]bandwidthTarget),
+		isolated: make(map[string]bandwidthTarget), blocked: make(map[string]*blockTarget),
 	}
 	go func() { session.done <- forwarder.Run(runCtx) }()
 	go session.refresh(runCtx)
@@ -270,11 +297,20 @@ func (s *bandwidthSession) isolateRoutes(ctx context.Context, addresses []netip.
 	if len(addresses) == 0 {
 		return errors.New("isolation target requires at least one address")
 	}
+	eligible := make([]netip.Addr, 0, len(addresses))
 	for _, address := range addresses {
 		if err := s.validateTarget(address, mac); err != nil {
+			if errors.Is(err, errIPv6Unverified) {
+				continue
+			}
 			return err
 		}
+		eligible = append(eligible, address)
 	}
+	if len(eligible) == 0 {
+		return errors.New("isolation target requires at least one eligible address")
+	}
+	addresses = eligible
 	key := mac.String()
 	s.mu.RLock()
 	_, forwarding := s.targets[key]
@@ -537,6 +573,7 @@ func (s *bandwidthSession) closeActive() error {
 		targets = append(targets, target)
 	}
 	s.isolated = make(map[string]bandwidthTarget)
+	s.blocked = make(map[string]*blockTarget)
 	s.isolationActive.Store(false)
 	s.mu.Unlock()
 	var result error
@@ -739,8 +776,11 @@ func (s *bandwidthSession) validateTarget(ip netip.Addr, mac net.HardwareAddr) e
 		s.mu.RLock()
 		local, router := s.localIPv6, s.routerIPv6
 		s.mu.RUnlock()
-		if !local.Is6() || !router.Is6() || ip == local || ip == router {
-			return errors.New("verified IPv6 local and router identities are required")
+		if !local.Is6() || !router.Is6() {
+			return errIPv6Unverified
+		}
+		if ip == local || ip == router {
+			return errors.New("bandwidth target is not an eligible IPv6 unicast address")
 		}
 	} else {
 		return errors.New("bandwidth target is outside the eligible local network")

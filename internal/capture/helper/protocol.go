@@ -20,18 +20,20 @@ import (
 )
 
 type Message struct {
-	Type       string                       `json:"type"`
-	RequestID  string                       `json:"request_id,omitempty"`
-	Data       []byte                       `json:"data,omitempty"`
-	CapturedAt time.Time                    `json:"captured_at,omitempty"`
-	Error      string                       `json:"error,omitempty"`
-	TargetIP   string                       `json:"target_ip,omitempty"`
-	TargetIPs  []string                     `json:"target_ips,omitempty"`
-	TargetMAC  string                       `json:"target_mac,omitempty"`
-	Policy     *shaping.Policy              `json:"policy,omitempty"`
-	Traffic    []shaping.DeviceTrafficStats `json:"traffic,omitempty"`
-	Forwarder  *shaping.ForwarderStats      `json:"forwarder,omitempty"`
-	Continuous bool                         `json:"continuous,omitempty"`
+	Type           string                       `json:"type"`
+	RequestID      string                       `json:"request_id,omitempty"`
+	Data           []byte                       `json:"data,omitempty"`
+	CapturedAt     time.Time                    `json:"captured_at,omitempty"`
+	Error          string                       `json:"error,omitempty"`
+	TargetIP       string                       `json:"target_ip,omitempty"`
+	TargetIPs      []string                     `json:"target_ips,omitempty"`
+	TargetMAC      string                       `json:"target_mac,omitempty"`
+	Policy         *shaping.Policy              `json:"policy,omitempty"`
+	Traffic        []shaping.DeviceTrafficStats `json:"traffic,omitempty"`
+	Forwarder      *shaping.ForwarderStats      `json:"forwarder,omitempty"`
+	Continuous     bool                         `json:"continuous,omitempty"`
+	Observations   []packet.Observation         `json:"observations,omitempty"`
+	BlockedDomains []string                     `json:"blocked_domains,omitempty"`
 }
 
 // Serve exposes filtered capture and only tightly scoped discovery, isolation,
@@ -47,6 +49,27 @@ func Serve(ctx context.Context, driver capture.Driver, localMAC net.HardwareAddr
 		defer outputMu.Unlock()
 		return encoder.Encode(message)
 	}
+	isOnLink := func(address netip.Addr) bool {
+		address = address.Unmap()
+		if prefix.IsValid() && prefix.Contains(address) {
+			return true
+		}
+		for _, candidate := range ipv6Prefixes {
+			if candidate.IsValid() && candidate.Contains(address) {
+				return true
+			}
+		}
+		return false
+	}
+	// emitDomains parses Layer 7 metadata for frames the helper consumes and
+	// forwards only the resulting observations, never the payloads themselves.
+	emitDomains := func(frame []byte) error {
+		observations := packet.InspectApplication(frame, isOnLink)
+		if len(observations) == 0 {
+			return nil
+		}
+		return write(Message{Type: "domains", Observations: observations})
+	}
 	var sendMu sync.Mutex
 	sendFrame := frameSenderFunc(func(sendCtx context.Context, frame []byte) error {
 		sendMu.Lock()
@@ -57,6 +80,7 @@ func Serve(ctx context.Context, driver capture.Driver, localMAC net.HardwareAddr
 	if err != nil {
 		return err
 	}
+	bandwidth.onLink = isOnLink
 	defer bandwidth.close()
 	if err := write(Message{Type: "ready"}); err != nil {
 		return err
@@ -83,13 +107,20 @@ func Serve(ctx context.Context, driver capture.Driver, localMAC net.HardwareAddr
 				bandwidth.observeNDP(message)
 			}
 		}
-		if (etherType == etherTypeIPv4 || etherType == packet.EtherTypeIPv6) && !ndpValid &&
-			(bandwidth.dropIsolated(frame.Data) || bandwidth.submit(frame.Data)) {
-			return nil
+	if (etherType == etherTypeIPv4 || etherType == packet.EtherTypeIPv6) && !ndpValid {
+		srcMAC := net.HardwareAddr(frame.Data[6:12])
+		// Never process frames the local machine's own NIC originated — they must pass through
+		// unmolested so the operator's browsing keeps working.
+		if bytes.Equal(srcMAC, localMAC) {
+			return emitDomains(frame.Data)
 		}
-		if len(frame.Data) >= packet.EthernetHeaderLen && bytes.Equal(frame.Data[6:12], localMAC) {
-			return nil
+		if bandwidth.dropBlocked(frame.Data) {
+			return emitDomains(frame.Data)
 		}
+		if bandwidth.dropIsolated(frame.Data) || bandwidth.submit(frame.Data) {
+			return emitDomains(frame.Data)
+		}
+	}
 		return write(Message{Type: "frame", Data: frame.Data, CapturedAt: frame.CapturedAt})
 	}
 	go func() {
@@ -121,7 +152,7 @@ func Serve(ctx context.Context, driver capture.Driver, localMAC net.HardwareAddr
 			if err := sendFrame(ctx, command.Data); err != nil {
 				_ = write(Message{Type: "error", Error: err.Error()})
 			}
-		case "shape_set", "shape_remove", "monitor_set", "monitor_remove", "isolate_set", "isolate_remove":
+		case "shape_set", "shape_remove", "monitor_set", "monitor_remove", "isolate_set", "isolate_remove", "block_set", "block_remove":
 			err := handleBandwidthCommand(ctx, bandwidth, command)
 			result := Message{Type: "result", RequestID: command.RequestID}
 			if err != nil {
@@ -167,6 +198,12 @@ func handleBandwidthCommand(ctx context.Context, bandwidth *bandwidthSession, co
 	mac, err := net.ParseMAC(command.TargetMAC)
 	if err != nil {
 		return fmt.Errorf("invalid bandwidth target MAC: %w", err)
+	}
+	if command.Type == "block_set" {
+		return bandwidth.setBlock(addresses, mac, command.BlockedDomains)
+	}
+	if command.Type == "block_remove" {
+		return bandwidth.removeBlock(mac)
 	}
 	if command.Type == "shape_remove" {
 		return bandwidth.removeRoutes(ctx, addresses, mac)
