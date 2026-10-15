@@ -29,6 +29,47 @@ import (
 type OpenDriver func(string) (capture.Driver, error)
 type ResolveHardware func(context.Context, capture.Driver, net.HardwareAddr, netip.Addr, netip.Addr) (net.HardwareAddr, error)
 
+// Bootstrap must never block forever: the default-route query decodes the
+// operating system routing table and gateway identity resolution waits for an
+// ARP reply, both of which can stall on a flaky adapter. These bounds turn any
+// such stall into a retryable, stage-tagged error instead of a silent hang.
+const (
+	gatewayDiscoveryTimeout = 5 * time.Second
+	gatewayDiscoveryRetries = 3
+	gatewayResolveTimeout   = 6 * time.Second
+	gatewayResolveRetries   = 3
+	bootstrapRetryPause     = 400 * time.Millisecond
+)
+
+// retryWithTimeout runs fn with a fresh, bounded context on each attempt and
+// returns the first success. It stops early when the parent context is done.
+func retryWithTimeout[T any](ctx context.Context, attempts int, timeout, pause time.Duration, fn func(context.Context) (T, error)) (T, error) {
+	var zero T
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			timer := time.NewTimer(pause)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return zero, ctx.Err()
+			case <-timer.C:
+			}
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		value, err := fn(attemptCtx)
+		cancel()
+		if err == nil {
+			return value, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return zero, ctx.Err()
+		}
+	}
+	return zero, lastErr
+}
+
 type MetadataEditor interface {
 	core.Enricher
 	SetNickname(net.HardwareAddr, string)
@@ -141,7 +182,7 @@ func Bootstrap(ctx context.Context, dependencies Dependencies, config Config) (*
 	}
 	applyRuntimeDefaults(&config)
 
-	route, err := dependencies.Gateway.Discover(ctx)
+	route, err := retryWithTimeout(ctx, gatewayDiscoveryRetries, gatewayDiscoveryTimeout, bootstrapRetryPause, dependencies.Gateway.Discover)
 	if err != nil {
 		return nil, stageError(StageGatewayRoute, err)
 	}
@@ -153,7 +194,9 @@ func Bootstrap(ctx context.Context, dependencies Dependencies, config Config) (*
 	if err != nil {
 		return nil, stageError(StageCaptureOpen, err)
 	}
-	gatewayMAC, err := dependencies.Resolve(ctx, driver, config.Interface.MAC, route.InterfaceIP, route.GatewayIP)
+	gatewayMAC, err := retryWithTimeout(ctx, gatewayResolveRetries, gatewayResolveTimeout, bootstrapRetryPause, func(attemptCtx context.Context) (net.HardwareAddr, error) {
+		return dependencies.Resolve(attemptCtx, driver, config.Interface.MAC, route.InterfaceIP, route.GatewayIP)
+	})
 	if err != nil {
 		driver.Close()
 		return nil, stageError(StageGatewayIdentity, fmt.Errorf("resolve default gateway identity: %w", err))

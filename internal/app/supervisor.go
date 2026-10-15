@@ -157,7 +157,7 @@ func (s *Supervisor) ScanNow(ctx context.Context) error {
 	if runtime := s.Current(); runtime != nil {
 		return runtime.ScanNow(ctx)
 	}
-	return errors.New("runtime is not available")
+	return errors.New(s.unavailableReason())
 }
 
 func (s *Supervisor) SetPeriodicScanEnabled(enabled bool) error {
@@ -165,7 +165,16 @@ func (s *Supervisor) SetPeriodicScanEnabled(enabled bool) error {
 		runtime.SetPeriodicScanEnabled(enabled)
 		return nil
 	}
-	return errors.New("runtime is not available")
+	return errors.New(s.unavailableReason())
+}
+
+// unavailableReason explains why no runtime is currently attached so the UI can
+// distinguish a first start still in progress from a post-change rebuild.
+func (s *Supervisor) unavailableReason() string {
+	if s.Status().Generation == 0 {
+		return "monitoring is still starting — try again in a moment"
+	}
+	return "monitoring is rebuilding after a network change — try again shortly"
 }
 
 func (s *Supervisor) publish(event Event) {

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"strings"
 	"syscall"
@@ -18,23 +19,30 @@ import (
 	coreapp "github.com/amdzy/NetWarden/internal/app"
 	"github.com/amdzy/NetWarden/internal/capture"
 	"github.com/amdzy/NetWarden/internal/capture/helperclient"
+	networkgateway "github.com/amdzy/NetWarden/internal/network/gateway"
 	"golang.org/x/sys/windows"
 )
 
 func configureCapture(ctx context.Context, dependencies *coreapp.Dependencies) error {
-	token, err := windows.OpenCurrentProcessToken()
-	if err == nil {
-		defer token.Close()
-		if token.IsElevated() {
-			return nil
-		}
-	}
 	executable, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("locate NetWarden executable: %w", err)
 	}
 	dependencies.Open = func(interfaceName string) (capture.Driver, error) {
 		return openWindowsElevatedHelper(ctx, executable, interfaceName)
+	}
+	resolveARP := dependencies.Resolve
+	if resolveARP != nil {
+		dependencies.Resolve = func(resolveCtx context.Context, driver capture.Driver, localMAC net.HardwareAddr, localIP, targetIP netip.Addr) (net.HardwareAddr, error) {
+			address, resolveErr := resolveARP(resolveCtx, driver, localMAC, localIP, targetIP)
+			if resolveErr == nil {
+				return address, nil
+			}
+			if fallback, fallbackErr := networkgateway.NeighborMAC(resolveCtx, targetIP); fallbackErr == nil {
+				return fallback, nil
+			}
+			return nil, resolveErr
+		}
 	}
 	return nil
 }
