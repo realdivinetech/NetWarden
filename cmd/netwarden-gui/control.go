@@ -175,7 +175,7 @@ func (a *GUIApp) ControlAudit(limit int) ([]ControlAuditDTO, error) {
 	}
 	result := make([]ControlAuditDTO, 0, len(events))
 	for _, event := range events {
-		item := ControlAuditDTO{At: event.At, Operation: string(event.Operation), Outcome: event.Outcome}
+		item := ControlAuditDTO{At: event.At, Operation: string(event.Operation), Outcome: event.Outcome, Targets: []string{}}
 		for _, target := range event.Targets {
 			item.Targets = append(item.Targets, target.IP.String()+" · "+target.MAC.String())
 		}

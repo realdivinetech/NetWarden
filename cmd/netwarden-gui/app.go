@@ -53,7 +53,9 @@ type BootstrapDTO struct {
 
 type StatusDTO struct {
 	coreapp.Status
-	ConflictCount int `json:"ConflictCount"`
+	ConflictCount int  `json:"ConflictCount"`
+	Active        bool `json:"Active"`
+	Starting      bool `json:"Starting"`
 }
 
 type IPv6NetworkDTO struct {
@@ -150,6 +152,14 @@ func (a *GUIApp) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.initializeLogger()
 	a.log(slog.LevelInfo, "application started", "component", "lifecycle")
+	// Frontend crashes (render errors, unhandled rejections) are emitted here
+	// by the ErrorBoundary and global handlers so they land in the app log
+	// instead of only existing as a blank window.
+	runtime.EventsOn(ctx, "frontend:error", func(optionalData ...interface{}) {
+		if len(optionalData) > 0 {
+			a.log(slog.LevelError, "frontend error", "component", "frontend", "detail", fmt.Sprint(optionalData[0]))
+		}
+	})
 	_, config, err := loadSettings()
 	if err != nil || !config.AutoStart || config.Interface == "" {
 		return
@@ -173,7 +183,7 @@ func (a *GUIApp) Bootstrap() (BootstrapDTO, error) {
 	if err != nil {
 		return BootstrapDTO{}, err
 	}
-	interfaces, err := pcapdriver.ListInterfaces()
+	listed, err := pcapdriver.ListInterfaces()
 	if err != nil {
 		return BootstrapDTO{}, err
 	}
@@ -181,10 +191,19 @@ func (a *GUIApp) Bootstrap() (BootstrapDTO, error) {
 	if err != nil {
 		return BootstrapDTO{}, err
 	}
-	interfaces = interfacesForRoute(interfaces, route)
+	interfaces := interfacesForRoute(listed, route)
+	if len(interfaces) == 0 {
+		// The default-route adapter could not be matched (VPN, virtual switch,
+		// or a transiently empty route table). Fall back to every usable
+		// adapter so the operator can still pick one instead of facing a
+		// silently disabled Start button.
+		interfaces = fallbackInterfaces(listed)
+	}
+	a.log(slog.LevelInfo, "bootstrap adapters resolved", "component", "lifecycle",
+		"listed", len(listed), "resolved", len(interfaces), "gateway", route.GatewayIP.String())
 	result := BootstrapDTO{GatewayMAC: config.GatewayMAC, Interfaces: make([]InterfaceDTO, 0, len(interfaces))}
 	for _, candidate := range interfaces {
-		item := InterfaceDTO{Name: candidate.Name, SystemName: candidate.SystemName, Description: candidate.Description, MAC: candidate.MAC.String()}
+		item := InterfaceDTO{Name: candidate.Name, SystemName: candidate.SystemName, Description: candidate.Description, MAC: candidate.MAC.String(), Prefixes: make([]string, 0, len(candidate.Prefixes))}
 		for _, prefix := range candidate.Prefixes {
 			item.Prefixes = append(item.Prefixes, prefix.String())
 		}
@@ -211,6 +230,40 @@ func interfacesForRoute(interfaces []pcapdriver.Interface, route networkgateway.
 			}
 		}
 		if !matches {
+			continue
+		}
+		key := candidate.SystemName
+		if key == "" {
+			key = candidate.Name
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		usable = append(usable, candidate)
+	}
+	return usable
+}
+
+// fallbackInterfaces returns every adapter that has a hardware address and at
+// least one usable IPv4 prefix, deduped by system name. It is used only when
+// interfacesForRoute matches nothing, so the adapter picker is never empty.
+func fallbackInterfaces(interfaces []pcapdriver.Interface) []pcapdriver.Interface {
+	usable := make([]pcapdriver.Interface, 0, len(interfaces))
+	seen := make(map[string]struct{})
+	for _, candidate := range interfaces {
+		if len(candidate.MAC) != 6 {
+			continue
+		}
+		hasIPv4 := false
+		for _, prefix := range candidate.Prefixes {
+			ip := prefix.Addr()
+			if ip.Is4() && !ip.IsLoopback() && !ip.IsLinkLocalUnicast() && !ip.IsUnspecified() {
+				hasIPv4 = true
+				break
+			}
+		}
+		if !hasIPv4 {
 			continue
 		}
 		key := candidate.SystemName
@@ -268,12 +321,16 @@ func (a *GUIApp) StartMonitoring(interfaceName string) (resultErr error) {
 	dependencies.Settings = store
 	dependencies.History = history.NewStore(store.Path() + ".history.json")
 	supervisor := coreapp.NewSupervisor(func(factoryContext context.Context) (*coreapp.Runtime, error) {
+		started := time.Now()
+		a.log(slog.LevelInfo, "runtime starting", "component", "lifecycle", "interface", selected.SystemName)
 		_, currentConfig, err := loadSettings()
 		if err != nil {
+			a.log(slog.LevelError, "runtime start failed", "component", "lifecycle", "error", err)
 			return nil, err
 		}
 		fresh, err := selectInterface(selected.Name)
 		if err != nil {
+			a.log(slog.LevelError, "runtime start failed", "component", "lifecycle", "error", err)
 			return nil, err
 		}
 		runtime, err := coreapp.Bootstrap(factoryContext, dependencies, coreapp.Config{
@@ -282,10 +339,13 @@ func (a *GUIApp) StartMonitoring(interfaceName string) (resultErr error) {
 			HistoryRetention: time.Duration(currentConfig.HistoryRetentionDays) * 24 * time.Hour,
 			ProbeDelay:       2 * time.Millisecond, MaximumHosts: 4094, PinnedGatewayMAC: storedMAC(currentConfig.GatewayMAC),
 		})
-		if err == nil {
-			runtime.SetPeriodicScanEnabled(currentConfig.PeriodicDiscovery)
+		if err != nil {
+			a.log(slog.LevelError, "runtime start failed", "component", "lifecycle", "error", err, "elapsed", time.Since(started).String())
+			return nil, err
 		}
-		return runtime, err
+		runtime.SetPeriodicScanEnabled(currentConfig.PeriodicDiscovery)
+		a.log(slog.LevelInfo, "runtime ready", "component", "lifecycle", "elapsed", time.Since(started).String())
+		return runtime, nil
 	}, time.Second)
 	a.supervisor, a.cancel = supervisor, cancel
 	a.appendActivityLocked(ActivityDTO{At: time.Now().UTC(), Kind: "lifecycle", Severity: "info", Title: "Monitoring requested", Detail: selected.SystemName})
@@ -332,10 +392,15 @@ func (a *GUIApp) Status() StatusDTO {
 		return status
 	}
 	status := supervisor.Status()
+	dto := StatusDTO{Status: status, ConflictCount: len(supervisor.ConflictHistory()), Active: true}
 	if supervisor.Current() == nil {
-		status.Rebuilding = true
+		if status.Generation == 0 {
+			dto.Starting = true
+		} else {
+			dto.Rebuilding = true
+		}
 	}
-	return StatusDTO{Status: status, ConflictCount: len(supervisor.ConflictHistory())}
+	return dto
 }
 
 func (a *GUIApp) IPv6Network() IPv6NetworkDTO {
@@ -995,7 +1060,26 @@ func selectInterface(name string) (pcapdriver.Interface, error) {
 	if err != nil {
 		return pcapdriver.Interface{}, err
 	}
-	return pcapdriver.SelectInterface(interfaces, name)
+	selected, err := pcapdriver.SelectInterface(interfaces, name)
+	if err != nil {
+		if errors.Is(err, pcapdriver.ErrInterfaceNotFound) && name != "" {
+			// Stored interface no longer exists (Windows GUID changed). Clear it
+			// and auto-detect a single usable interface.
+			_ = clearStoredInterface()
+			return pcapdriver.SelectInterface(interfaces, "")
+		}
+		return pcapdriver.Interface{}, err
+	}
+	return selected, nil
+}
+
+func clearStoredInterface() error {
+	store, _, err := loadSettings()
+	if err != nil {
+		return err
+	}
+	_, err = store.SetInterface("")
+	return err
 }
 
 func storedMAC(value string) net.HardwareAddr {
