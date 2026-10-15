@@ -22,6 +22,7 @@ import { formatDate } from "@/lib/format"
 import { MonitoringSettingsCard } from "./MonitoringSettingsCard"
 import { ApplicationPreferencesCard } from "./ApplicationPreferencesCard"
 import { NotificationSettingsCard } from "./NotificationSettingsCard"
+import { GatewayAuthorizationCard } from "./GatewayAuthorizationCard"
 import { useClearHistory, useHistorySummary, usePruneHistory, useSetGatewayMAC } from "./settings.queries"
 import { useOpenApplicationDirectory } from "./settings.queries"
 import { useUnsavedChanges } from "@/app/unsaved-changes"
@@ -39,7 +40,7 @@ export function SettingsView() {
   const [gatewayMAC, setGatewayMAC] = useState("")
   const [pruneDays, setPruneDays] = useState(90)
   useEffect(() => setGatewayMAC(bootstrap?.gatewayMAC || ""), [bootstrap?.gatewayMAC])
-  const running = Boolean(status?.Running || status?.Rebuilding)
+  const running = Boolean(status?.Running || status?.Rebuilding || status?.Starting)
   const saved = bootstrap?.gatewayMAC || ""
   const gatewayChanged = gatewayMAC.trim().toLowerCase() !== saved.toLowerCase()
   const gatewayError = validateGatewayMAC(gatewayMAC)
@@ -50,6 +51,7 @@ export function SettingsView() {
       <ApplicationPreferencesCard />
       <MonitoringSettingsCard />
       <NotificationSettingsCard />
+      <GatewayAuthorizationCard />
       <Card className="bg-card/60">
         <CardHeader className="border-b">
           <CardTitle>Network identity</CardTitle>

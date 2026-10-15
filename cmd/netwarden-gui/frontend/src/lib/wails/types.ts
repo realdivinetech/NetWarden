@@ -1,6 +1,7 @@
 export type Adapter = { name: string; systemName: string; description: string; mac: string; prefixes: string[] }
 export type Bootstrap = { interfaces: Adapter[]; selectedInterface: string; gatewayMAC: string }
 export type DeviceControlState = "" | "active" | "continuous" | "restoring" | "failed"
+export type DeviceDomain = { domain: string; kind: string; platform?: string; remote?: string; lastSeen: string }
 export type Device = {
   ip: string
   addresses: string[]
@@ -13,6 +14,7 @@ export type Device = {
   lastSeen: string
   online: boolean
   controlState: DeviceControlState
+  domains?: DeviceDomain[]
 }
 export type Conflict = {
   gatewayIP: string
@@ -35,6 +37,8 @@ export type RuntimeStatus = {
   LastRestartReason: string
   SupervisorDroppedEvents: number
   ConflictCount: number
+  Active: boolean
+  Starting: boolean
   LastPersistenceError: string
   BandwidthAvailable: boolean
   ActiveBandwidthLimits: number
@@ -45,6 +49,8 @@ export type RuntimeStatus = {
   IPv6RouterMAC: string
   IPv6PrefixCount: number
   IPv6RouterConflicts: number
+  DomainBlockAvailable: boolean
+  ActiveDomainBlocks: number
 }
 export type IPv6Prefix = {
   prefix: string
@@ -72,6 +78,17 @@ export type IPv6Network = {
   trustedIdentities: Array<{ routerIP: string; mac: string }>
 }
 export type HistorySummary = { devices: number; conflicts: number; oldest?: string; newest?: string }
+export type GatewayStatus = {
+  authorized: boolean
+  verified: boolean
+  gatewayIP: string
+  gatewayMAC: string
+  authorizedAt?: string
+  strategy?: string
+  usernameRequired: boolean
+  adapters: string[]
+  error?: string
+}
 export type Activity = {
   at: string
   kind: string
@@ -158,3 +175,23 @@ export type BandwidthHealth = {
   samplingError?: string
 }
 export type AppInfo = { name: string; version: string; build: string }
+export type DomainBlock = { ip: string; mac: string; domains: string[]; active: boolean }
+export type PresetAction = "disconnect" | "limit" | "block"
+export type Preset = {
+  id: string
+  name: string
+  action: PresetAction
+  download_bits_per_second?: number
+  upload_bits_per_second?: number
+  domains?: string[]
+}
+export type Schedule = {
+  id: string
+  name: string
+  enabled: boolean
+  days: number[]
+  start: string
+  end: string
+  preset_id: string
+  macs: string[]
+}

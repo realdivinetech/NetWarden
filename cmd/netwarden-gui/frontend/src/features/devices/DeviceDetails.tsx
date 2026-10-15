@@ -22,7 +22,10 @@ import { formatDate } from "@/lib/format"
 import { copyText } from "@/lib/wails/clipboard"
 import type { Device } from "@/lib/wails/types"
 import type { BandwidthLimit } from "@/lib/wails/types"
+import type { DomainBlock } from "@/lib/wails/types"
 import { BandwidthSection } from "@/features/bandwidth/BandwidthSection"
+import { DomainBlockSection } from "@/features/automation/DomainBlockSection"
+import { PresetApplySection } from "@/features/automation/PresetApplySection"
 import { useSetNickname } from "./devices.queries"
 import { isControlEligible } from "./device-list"
 import {
@@ -69,6 +72,8 @@ export function DeviceDetails({
   bandwidthAvailable,
   bandwidthMonitoringAvailable,
   bandwidthMonitored,
+  domainBlock,
+  domainBlockAvailable,
   onClose,
 }: {
   device?: Device
@@ -76,6 +81,8 @@ export function DeviceDetails({
   bandwidthAvailable: boolean
   bandwidthMonitoringAvailable: boolean
   bandwidthMonitored: boolean
+  domainBlock?: DomainBlock
+  domainBlockAvailable: boolean
   onClose: () => void
 }) {
   const [nickname, setNickname] = useState("")
@@ -126,6 +133,12 @@ export function DeviceDetails({
               </dl>
             </section>
             <Separator />
+            <DomainsSection domains={device.domains} online={device.online} />
+            <Separator />
+            <DomainBlockSection device={device} block={domainBlock} available={domainBlockAvailable} />
+            <Separator />
+            <PresetApplySection device={device} />
+            <Separator />
             <ControlSection device={device} bandwidthActive={Boolean(bandwidthLimit) || bandwidthMonitored} />
             <Separator />
             <BandwidthSection device={device} limit={bandwidthLimit} available={bandwidthAvailable} monitoringAvailable={bandwidthMonitoringAvailable} monitored={bandwidthMonitored} />
@@ -165,6 +178,49 @@ export function DeviceDetails({
   )
 }
 
+function DomainsSection({ domains, online }: { domains?: Device["domains"]; online: boolean }) {
+  const entries = domains ?? []
+  return (
+    <section className="py-6">
+      <div className="mb-3 flex items-center justify-between">
+        <h4 className="text-xs font-semibold">Observed domains</h4>
+        <Badge variant="outline">{entries.length}</Badge>
+      </div>
+      {entries.length === 0 ? (
+        <p className="text-xs text-muted-foreground">
+          No hostnames seen yet{online ? "" : " since the device came back online"}.
+        </p>
+      ) : (
+        <ul className="space-y-2">
+          {entries.map((entry) => (
+            <li key={`${entry.domain}-${entry.kind}`} className="flex items-start justify-between gap-3 text-xs">
+              <div className="min-w-0">
+                <p className="truncate font-mono" title={entry.domain}>
+                  {entry.domain}
+                  {entry.platform && (
+                    <span className="ml-1.5 text-[9px] font-medium text-primary/80 bg-primary/10 px-1.5 py-0.5 rounded">
+                      {entry.platform}
+                    </span>
+                  )}
+                </p>
+                {entry.remote && (
+                  <p className="mt-0.5 truncate text-muted-foreground" title={entry.remote}>
+                    {entry.remote}
+                  </p>
+                )}
+              </div>
+              <div className="flex shrink-0 items-center gap-2">
+                <Badge variant={entry.kind === "sni" ? "default" : "secondary"}>{entry.kind === "sni" ? "TLS" : "DNS"}</Badge>
+                <span className="text-muted-foreground">{formatDate(entry.lastSeen)}</span>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  )
+}
+
 function ControlSection({ device, bandwidthActive }: { device: Device; bandwidthActive: boolean }) {
   const eligible = isControlEligible(device) && !bandwidthActive
   const disconnect = useDisconnectDevice()
@@ -173,7 +229,7 @@ function ControlSection({ device, bandwidthActive }: { device: Device; bandwidth
   const stop = useStopContinuousControl()
   const { data: audit = [] } = useControlAudit()
   const recent = audit
-    .filter((event) => event.targets.some((target) => target.toLowerCase().includes(device.mac.toLowerCase())))
+    .filter((event) => (event.targets ?? []).some((target) => target.toLowerCase().includes(device.mac.toLowerCase())))
     .slice(0, 3)
   const pending = disconnect.isPending || continuous.isPending || restore.isPending || stop.isPending
   const recovering = restore.isPending || stop.isPending || device.controlState === "restoring"

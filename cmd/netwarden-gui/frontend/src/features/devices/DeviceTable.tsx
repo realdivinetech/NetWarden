@@ -33,7 +33,7 @@ export function DeviceTable({
   const someChecked = eligible.some((device) => checkedMACs.has(device.mac))
   return (
     <div className="overflow-x-auto">
-      <Table className="min-w-[1150px]">
+      <Table className="min-w-[1330px]">
         <TableHeader>
           <TableRow>
             <TableHead className="w-10">
@@ -47,6 +47,7 @@ export function DeviceTable({
             </TableHead>
             <TableHead>Device</TableHead>
             <TableHead>Address</TableHead>
+            <TableHead>Domains</TableHead>
             <TableHead>Vendor</TableHead>
             <TableHead>Type</TableHead>
             <TableHead>Role</TableHead>
@@ -140,6 +141,9 @@ function DeviceRow({
         </div>
       </TableCell>
       <TableCell>{device.ip}</TableCell>
+      <TableCell className="max-w-56 whitespace-nowrap">
+        {domainSummary(device.domains)}
+      </TableCell>
       <TableCell className="max-w-48 truncate text-muted-foreground" title={device.vendor}>
         {device.vendor || "Unknown"}
       </TableCell>
@@ -166,6 +170,22 @@ function DeviceRow({
         <ChevronRight className="size-4 text-muted-foreground" />
       </TableCell>
     </TableRow>
+  )
+}
+
+function domainSummary(domains?: Device["domains"]) {
+  if (!domains?.length) {
+    return <span className="text-xs text-muted-foreground">—</span>
+  }
+  const names = domains.map((entry) => entry.domain)
+  const visible = names.slice(0, 2)
+  return (
+    <span className="flex items-center gap-1.5 text-xs text-muted-foreground" title={names.join(", ")}>
+      <span className="truncate">{visible.join(", ")}</span>
+      {names.length > visible.length && (
+        <span className="shrink-0 rounded bg-muted px-1 text-[10px]">+{names.length - visible.length}</span>
+      )}
+    </span>
   )
 }
 

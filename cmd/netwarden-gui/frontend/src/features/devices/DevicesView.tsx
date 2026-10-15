@@ -7,6 +7,7 @@ import { MonitoringOverview } from "@/features/monitoring/MonitoringOverview"
 import { useBandwidthLimits, useClearBandwidthLimits } from "@/features/bandwidth/bandwidth.queries"
 import { useBandwidthMonitors } from "@/features/bandwidth/monitor.queries"
 import { useRuntimeStatus } from "@/features/monitoring/monitoring.queries"
+import { useDomainBlocks } from "@/features/automation/automation.queries"
 import type { Device } from "@/lib/wails/types"
 import { BulkProgress } from "./DeviceBulkActions"
 import { DeviceDetails } from "./DeviceDetails"
@@ -20,6 +21,7 @@ export function DevicesView() {
   const { data: bandwidthLimits = [] } = useBandwidthLimits()
   const { data: runtimeStatus } = useRuntimeStatus()
   const { data: bandwidthMonitors = [] } = useBandwidthMonitors(Boolean(runtimeStatus?.BandwidthMonitoringAvailable && runtimeStatus?.Running))
+  const { data: domainBlocks = [] } = useDomainBlocks()
   const clearBandwidth = useClearBandwidthLimits()
   const [preferences, setPreferences] = useState<DevicePreferences>(defaultDevicePreferences)
   const [detailsMAC, setDetailsMAC] = useState("")
@@ -41,6 +43,10 @@ export function DevicesView() {
   const bandwidthBlockedMACs = useMemo(
     () => new Set([...bandwidthByMAC.keys(), ...bandwidthMonitors.map((target) => target.mac.toLowerCase())]),
     [bandwidthByMAC, bandwidthMonitors],
+  )
+  const domainBlockByMAC = useMemo(
+    () => new Map(domainBlocks.map((block) => [block.mac.toLowerCase(), block])),
+    [domainBlocks],
   )
   const visible = useMemo(() => filterAndSortDevices(devices, preferences), [devices, preferences])
   const selectedTargets = devices
@@ -157,6 +163,8 @@ export function DevicesView() {
         bandwidthAvailable={Boolean(runtimeStatus?.BandwidthAvailable)}
         bandwidthMonitoringAvailable={Boolean(runtimeStatus?.BandwidthMonitoringAvailable)}
         bandwidthMonitored={Boolean(selected && bandwidthMonitors.some((target) => target.mac.toLowerCase() === selected.mac.toLowerCase()))}
+        domainBlock={selected ? domainBlockByMAC.get(selected.mac.toLowerCase()) : undefined}
+        domainBlockAvailable={Boolean(runtimeStatus?.DomainBlockAvailable)}
         onClose={closeDetails}
       />
     </>
@@ -166,7 +174,9 @@ export function DevicesView() {
 function filterAndSortDevices(devices: Device[], preferences: DevicePreferences) {
   return devices
     .filter((device) =>
-      `${device.name} ${device.ip} ${device.mac} ${device.vendor} ${device.type}`
+      `${device.name} ${device.ip} ${device.mac} ${device.vendor} ${device.type} ${(device.domains ?? [])
+        .map((entry) => entry.domain)
+        .join(" ")}`
         .toLowerCase()
         .includes(preferences.query.toLowerCase()),
     )

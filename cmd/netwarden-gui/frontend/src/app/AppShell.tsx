@@ -1,15 +1,16 @@
 import type { ReactNode } from "react"
-import { Gauge, LaptopMinimal, Logs, Radar, Settings, ShieldCheck } from "lucide-react"
+import { Gauge, LaptopMinimal, Logs, Radar, Settings, ShieldCheck, Workflow } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { useRuntimeStatus } from "@/features/monitoring/monitoring.queries"
 import { cn } from "@/lib/utils"
 
-export type AppView = "devices" | "bandwidth" | "integrity" | "diagnostics" | "settings"
+export type AppView = "devices" | "bandwidth" | "automation" | "integrity" | "diagnostics" | "settings"
 
 const navigation: Array<{ value: AppView; label: string; icon: typeof LaptopMinimal }> = [
   { value: "devices", label: "Devices", icon: LaptopMinimal },
   { value: "bandwidth", label: "Bandwidth", icon: Gauge },
+  { value: "automation", label: "Automation", icon: Workflow },
   { value: "integrity", label: "Gateway Security", icon: ShieldCheck },
   { value: "diagnostics", label: "Diagnostics", icon: Logs },
   { value: "settings", label: "Settings", icon: Settings },
@@ -25,7 +26,7 @@ export function AppShell({
   children: ReactNode
 }) {
   const { data: status } = useRuntimeStatus()
-  const running = Boolean(status?.Running || status?.Rebuilding)
+  const running = Boolean(status?.Running || status?.Rebuilding || status?.Starting)
 
   return (
     <main className="mx-auto min-h-screen max-w-[1440px] px-3 sm:px-6 lg:px-10">
@@ -81,7 +82,7 @@ export function AppShell({
   )
 }
 
-function BrandIcon() {
+export function BrandIcon() {
   return (
     <svg
       viewBox="0 0 36 36"

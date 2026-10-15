@@ -1,5 +1,7 @@
 export const queryKeys = {
   appInfo: ["app-info"] as const,
+  gateway: ["gateway"] as const,
+  gatewayStatus: ["gateway", "status"] as const,
   runtime: ["runtime"] as const,
   bootstrap: ["runtime", "bootstrap"] as const,
   status: ["runtime", "status"] as const,
@@ -16,4 +18,7 @@ export const queryKeys = {
   bandwidthMeasurements: ["runtime", "bandwidth-measurements"] as const,
   bandwidthHealth: ["runtime", "bandwidth-health"] as const,
   bandwidthHistory: (mac: string, range: string) => ["runtime", "bandwidth-history", mac, range] as const,
+  domainBlocks: ["runtime", "domain-blocks"] as const,
+  presets: ["runtime", "presets"] as const,
+  schedules: ["runtime", "schedules"] as const,
 }
