@@ -346,6 +346,11 @@ func (f *Forwarder) classify(frame []byte) (queuedFrame, error) {
 		return queuedFrame{}, ErrFrameNotManaged
 	}
 	destination, source := net.HardwareAddr(frame[:6]), net.HardwareAddr(frame[6:12])
+	// Exclude frames the local machine's own NIC originated — operator traffic
+	// must never be shaped, dropped, or counted.
+	if bytes.Equal(source, f.localMAC) {
+		return queuedFrame{}, ErrFrameNotManaged
+	}
 	if !bytes.Equal(destination, f.localMAC) {
 		return queuedFrame{}, ErrFrameNotManaged
 	}
