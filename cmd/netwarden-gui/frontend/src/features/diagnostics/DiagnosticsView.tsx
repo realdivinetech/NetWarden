@@ -45,7 +45,7 @@ export function DiagnosticsView() {
           kind: `control:${event.operation}`,
           severity: controlSeverity(event.outcome),
           title: controlTitle(event.operation),
-          detail: `${event.outcome.replaceAll("_", " ")}${event.targets.length ? ` · ${event.targets.join(", ")}` : ""}`,
+          detail: `${event.outcome.replaceAll("_", " ")}${(event.targets ?? []).length ? ` · ${(event.targets ?? []).join(", ")}` : ""}`,
           source: "control" as const,
         })),
       ].sort((left, right) => new Date(right.at).getTime() - new Date(left.at).getTime()),
@@ -58,7 +58,7 @@ export function DiagnosticsView() {
     .filter((event) => `${event.kind} ${event.title} ${event.detail || ""}`.toLowerCase().includes(query.toLowerCase()))
   const error = runtime.error || control.error
   const dropped = (status?.DroppedEvents || 0) + (status?.SupervisorDroppedEvents || 0)
-  const healthy = !status?.Rebuilding && !status?.LastPersistenceError
+  const healthy = !status?.Rebuilding && !status?.Starting && !status?.LastPersistenceError
   const report = () => ({ generatedAt: new Date().toISOString(), status, events })
   const copySummary = async () => {
     try {

@@ -105,7 +105,7 @@ export function IntegrityView() {
         </Badge>
       </CardHeader>
       <CardContent className="p-0">
-        {ipv6?.conflicts.some((conflict) => conflict.active) && (
+        {(ipv6?.conflicts ?? []).some((conflict) => conflict.active) && (
           <div className="p-5">
             <Alert variant="destructive">
               <ShieldAlert />
@@ -114,7 +114,7 @@ export function IntegrityView() {
             </Alert>
           </div>
         )}
-        {ipv6?.routers.length ? (
+        {ipv6?.routers?.length ? (
           <div className="overflow-x-auto">
             <Table className="min-w-[820px]">
               <TableHeader>
@@ -136,7 +136,7 @@ export function IntegrityView() {
                     <TableCell className="font-mono text-xs">{router.mac}</TableCell>
                     <TableCell>{router.preference > 0 ? "High" : router.preference < 0 ? "Low" : "Medium"}</TableCell>
                     <TableCell>
-                      {router.prefixes.length ? router.prefixes.map((prefix) => (
+                      {router.prefixes?.length ? router.prefixes.map((prefix) => (
                         <div key={prefix.prefix} className="mb-1">
                           <p className="font-mono text-xs">{prefix.prefix}</p>
                           <p className="text-[10px] text-muted-foreground">
@@ -158,7 +158,7 @@ export function IntegrityView() {
             <p className="mt-1 text-xs text-muted-foreground">Validated Router Advertisements will appear here.</p>
           </div>
         )}
-        {ipv6?.conflicts.length ? (
+        {ipv6?.conflicts?.length ? (
           <div className="border-t p-5">
             <h4 className="mb-3 text-xs font-semibold">IPv6 identity history</h4>
             {ipv6.conflicts.map((conflict) => (
@@ -170,7 +170,7 @@ export function IntegrityView() {
             ))}
           </div>
         ) : null}
-        {ipv6?.trustedIdentities.length ? (
+        {ipv6?.trustedIdentities?.length ? (
           <div className="border-t p-5">
             <h4 className="mb-3 text-xs font-semibold">Learned router identities</h4>
             <div className="flex flex-wrap gap-2">

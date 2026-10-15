@@ -27,7 +27,7 @@ export function MonitoringSettingsCard() {
   useEffect(() => {
     if (data) setForm(data)
   }, [data])
-  const running = Boolean(status?.Running || status?.Rebuilding)
+  const running = Boolean(status?.Running || status?.Rebuilding || status?.Starting)
   const changed = Boolean(data && JSON.stringify(form) !== JSON.stringify(data))
   useUnsavedChanges("monitoring-settings", changed)
   const errors = {

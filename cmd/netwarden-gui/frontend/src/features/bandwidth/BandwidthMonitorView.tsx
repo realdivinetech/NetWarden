@@ -177,7 +177,7 @@ function MetricCard({ label, value, icon }: { label: string; value: string; icon
 }
 
 function TrafficBars({ measurement }: { measurement?: BandwidthMeasurement }) {
-  const points = measurement?.history.slice(-30) || []
+  const points = measurement?.history?.slice(-30) || []
   const maximum = Math.max(1, ...points.map((point) => point.uploadBPS + point.downloadBPS))
   return <div className="flex h-8 w-36 items-end gap-px" aria-label="Recent bandwidth activity">{points.map((point) => <span key={point.at} className="min-w-0 flex-1 rounded-t-sm bg-primary/70" style={{ height: `${Math.max(8, ((point.uploadBPS + point.downloadBPS) / maximum) * 100)}%` }} />)}</div>
 }

@@ -16,12 +16,25 @@ export function MonitoringOverview() {
   const { data: devices = [] } = useDevices()
   const [selected, setSelected] = useState("")
   useEffect(() => {
-    if (bootstrap && !selected) setSelected(bootstrap.selectedInterface || bootstrap.interfaces[0]?.name || "")
+    if (!bootstrap || selected) return
+    const firstNamed = bootstrap.interfaces.find((a) => a.name && a.name.trim() !== "")
+    if (firstNamed) setSelected(firstNamed.name)
+    else if (bootstrap.selectedInterface) setSelected(bootstrap.selectedInterface)
   }, [bootstrap, selected])
-  const running = Boolean(status?.Running || status?.Rebuilding)
+  const running = Boolean(status?.Running)
+  const starting = Boolean(status?.Starting)
+  const rebuilding = Boolean(status?.Rebuilding)
+  const busy = starting || rebuilding
+  const active = running || busy
   const start = useRuntimeAction((name: string) => wailsClient.startMonitoring(name), "Monitoring started")
   const stop = useRuntimeAction(() => wailsClient.stopMonitoring(), "Monitoring stopped")
-  const scan = useRuntimeAction(() => wailsClient.scanNow(), "Scan started")
+  const scan = useRuntimeAction(
+    () => {
+      if (!status?.Running) throw new Error("Monitoring must be running before scanning")
+      return wailsClient.scanNow()
+    },
+    "Scan started"
+  )
   const periodic = useRuntimeAction(
     (enabled: boolean) => wailsClient.setPeriodicScanEnabled(enabled),
     "Periodic discovery updated",
@@ -48,6 +61,15 @@ export function MonitoringOverview() {
           />
         </div>
       )}
+      {!bootstrapError && bootstrap && (bootstrap.interfaces?.length ?? 0) === 0 && (
+        <p className="mb-5 text-xs text-muted-foreground">
+          No network adapter with an active IPv4 address was found. Connect to a network, then{" "}
+          <button type="button" className="underline underline-offset-2" onClick={() => void retryBootstrap()}>
+            retry
+          </button>
+          .
+        </p>
+      )}
       <div className="mb-8 flex flex-col gap-5 lg:flex-row lg:items-end lg:justify-between lg:gap-8">
         <div>
           <p className="mb-2 text-[10px] font-semibold tracking-[.18em] text-primary uppercase">Network overview</p>
@@ -60,26 +82,35 @@ export function MonitoringOverview() {
           <NativeSelect
             value={selected}
             onChange={(event) => setSelected(event.target.value)}
-            disabled={running || Boolean(bootstrapError)}
+            disabled={active || Boolean(bootstrapError)}
             className="w-full sm:w-64"
           >
             <NativeSelectOption value="">Select an adapter</NativeSelectOption>
-            {bootstrap?.interfaces.map((adapter) => (
+            {(bootstrap?.interfaces ?? []).map((adapter) => (
               <NativeSelectOption key={adapter.name} value={adapter.name}>
-                {adapter.systemName || adapter.name} · {adapter.prefixes.join(", ")}
+                {adapter.systemName || adapter.name} · {(adapter.prefixes ?? []).join(", ")}
               </NativeSelectOption>
             ))}
           </NativeSelect>
           <Button
-            variant={running ? "destructive" : "default"}
+            variant={active ? "destructive" : "default"}
             disabled={!selected || start.isPending || stop.isPending}
-            onClick={() => (running ? stop.mutate() : start.mutate(selected))}
+            title={!selected ? "Select a network adapter to start monitoring" : undefined}
+            onClick={() => (active ? stop.mutate() : start.mutate(selected))}
           >
-            {running ? <CircleStop /> : <Play />}
-            {running ? "Stop monitoring" : "Start monitoring"}
+            {active ? <CircleStop /> : <Play />}
+            {running ? "Stop monitoring" : busy ? "Cancel" : "Start monitoring"}
           </Button>
         </div>
       </div>
+      {busy && (
+        <p className="-mt-4 mb-6 text-xs text-muted-foreground">
+          {starting
+            ? "Starting monitoring — requesting the privileged capture helper. Approve the Windows elevation prompt if one appears."
+            : "Rebuilding monitoring after a network change."}
+          {status?.LastRestartReason ? ` Last: ${status.LastRestartReason}` : ""}
+        </p>
+      )}
       <div className="grid grid-cols-2 overflow-hidden rounded-xl border bg-card/50 lg:grid-cols-4">
         {stats.map(({ label, value, icon: Icon }) => (
           <Card
@@ -102,7 +133,7 @@ export function MonitoringOverview() {
         </p>
       )}
       <div className="mt-3 flex flex-wrap justify-end gap-5">
-        <Button variant="outline" size="sm" disabled={!running || status?.Scanning} onClick={() => scan.mutate()}>
+        <Button variant="outline" size="sm" disabled={!status?.Running || status?.Scanning} onClick={() => scan.mutate()}>
           <RefreshCw className={status?.Scanning ? "animate-spin" : ""} />
           Scan now
         </Button>

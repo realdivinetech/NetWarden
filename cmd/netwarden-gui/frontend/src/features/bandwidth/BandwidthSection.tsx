@@ -42,6 +42,16 @@ export function BandwidthSection({
   const validation = bandwidthValidation(download, upload)
   const eligible = available && isBandwidthEligible(device)
   const pending = setLimit.isPending || removeLimit.isPending
+  const monitorEligible = monitoringAvailable && isBandwidthEligible(device)
+  const monitorReason = !monitoringAvailable
+    ? "Start monitoring from Network overview before monitoring a device."
+    : !device.online
+      ? "The device must be online to monitor it."
+      : device.role !== "Device"
+        ? "Only regular devices on the network can be monitored."
+        : device.controlState !== ""
+          ? "Restore normal access before monitoring this device."
+          : ""
   const reason = !available
     ? "Bandwidth control is unavailable with the active capture backend."
       : device.role !== "Device"
@@ -55,8 +65,11 @@ export function BandwidthSection({
     <section className="space-y-4 py-6">
       <div className="flex items-center justify-between gap-3 rounded-lg border bg-background/30 p-3">
         <div><h4 className="text-xs font-semibold">Traffic monitoring</h4><p className="mt-1 text-xs text-muted-foreground">Measure live rates, totals, peaks, and history.</p></div>
-        {monitored ? <Button size="sm" variant="outline" disabled={Boolean(limit) || stopMonitor.isPending} onClick={() => stopMonitor.mutate(device.mac)}><RotateCcw /> Stop</Button> : <Button size="sm" variant="outline" disabled={!monitoringAvailable || !isBandwidthEligible(device) || startMonitor.isPending} onClick={() => startMonitor.mutate({ip: device.ip, mac: device.mac})}><Gauge /> Start</Button>}
+        {monitored ? <Button size="sm" variant="outline" disabled={Boolean(limit) || stopMonitor.isPending} onClick={() => stopMonitor.mutate(device.mac)}><RotateCcw /> Stop</Button> : <Button size="sm" variant="outline" title={monitorEligible ? undefined : monitorReason} disabled={!monitorEligible || startMonitor.isPending} onClick={() => startMonitor.mutate({ip: device.ip, mac: device.mac})}><Gauge /> Start</Button>}
       </div>
+      {!monitored && !monitorEligible && monitorReason && (
+        <p className="-mt-2 text-xs text-muted-foreground">{monitorReason}</p>
+      )}
       <div className="flex items-center justify-between gap-3">
         <div>
           <h4 className="text-xs font-semibold">Bandwidth limit</h4>
