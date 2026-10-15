@@ -100,6 +100,8 @@ npm run lint
 
 The host Go cache may be inaccessible in sandboxed sessions, so use the `/tmp` cache paths above. libpcap may emit a harmless duplicate-library linker warning on macOS.
 
+Building the desktop shell with `wails build` (see `Makefile` `gui-build`) requires the Wails CLI **v2.16.0 or later**. Older CLIs (through v2.13.0) bundle `golang.org/x/tools` v0.44.0, whose type loader crashes with `internal error: package "..." without types was imported from ...` against newer Go toolchains (observed on Go 1.27.2) while scanning embed directories. Upgrade with `go install github.com/wailsapp/wails/v2/cmd/wails@v2.16.0`. As a fallback, `wails build -skipembedcreate` also avoids the crash because the app's only embed target (`frontend/dist`) already exists.
+
 Before handoff, also run:
 
 ```sh

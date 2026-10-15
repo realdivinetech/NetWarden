@@ -5,6 +5,24 @@ your local network. It gives you a live view of what is connected, helps you
 recognize unfamiliar devices, and watches for unexpected changes to your
 network gateway.
 
+## Attribution
+
+This repository is a **fork of [amdzy/NetWarden](https://github.com/amdzy/NetWarden)**
+by **amdzy**, used under the [GNU GPL v3 or later](LICENSE). All credit for the
+original design and codebase belongs to the upstream project; this fork is not
+affiliated with it.
+
+**Modified and extended since 15 October 2026.** Changes relative to upstream
+are tracked in this repository's history and add, among other things:
+
+- Passive domain inspection (DNS and TLS SNI) surfaced per device.
+- Domain-based platform classification (e.g. Streaming, Social, Work).
+- Domain blocking rules and per-device blocklists.
+- Gateway authorization for logging into supported routers.
+- Presets and scheduled monitoring/scan automation.
+- IPv6/dual-stack bandwidth handling and local-MAC passthrough fixes.
+- A monitoring start path that can no longer hang during ARP discovery.
+
 ## What you can do
 
 - Discover devices connected to your current network.
