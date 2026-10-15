@@ -11,9 +11,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
-const CurrentVersion = 4
+const CurrentVersion = 6
 
 const (
 	DefaultScanIntervalSeconds  = 10
@@ -43,6 +44,24 @@ type Config struct {
 	NotifyKnownDevices   bool              `json:"notify_known_devices"`
 	NotifyDeviceOffline  bool              `json:"notify_device_offline"`
 	NotifySuspicious     bool              `json:"notify_suspicious"`
+	Presets              []Preset          `json:"presets,omitempty"`
+	Schedules            []Schedule        `json:"schedules,omitempty"`
+	DomainBlocks         map[string][]string `json:"domain_blocks,omitempty"`
+	GatewayAuth          *GatewayAuthRecord `json:"gateway_auth,omitempty"`
+}
+
+// GatewayAuthRecord is the proof that the operator passed the gateway
+// authorization gate for one network. It never contains the router password:
+// only a protected random secret and its HMAC bound to the gateway identity.
+type GatewayAuthRecord struct {
+	AuthorizedAt time.Time `json:"authorized_at"`
+	GatewayIP    string    `json:"gateway_ip"`
+	LocalIP      string    `json:"local_ip,omitempty"`
+	GatewayMAC   string    `json:"gateway_mac,omitempty"`
+	Strategy     string    `json:"strategy"`
+	Verified     bool      `json:"verified"`
+	Secret       string    `json:"secret"`
+	Proof        string    `json:"proof"`
 }
 
 type NotificationSettings struct {
@@ -104,6 +123,39 @@ func (s *Store) RemoveGatewayMAC() (Config, error) {
 	})
 }
 
+// SetGatewayAuth stores the gateway authorization record; a nil record clears
+// it, forcing the operator through the authorization gate again.
+func (s *Store) SetGatewayAuth(record *GatewayAuthRecord) (Config, error) {
+	if record != nil {
+		normalized, err := normalizeGatewayAuth(record)
+		if err != nil {
+			return Config{}, err
+		}
+		record = normalized
+	}
+	return s.update(func(config *Config) error {
+		config.GatewayAuth = record
+		return nil
+	})
+}
+
+func normalizeGatewayAuth(record *GatewayAuthRecord) (*GatewayAuthRecord, error) {
+	if record == nil {
+		return nil, nil
+	}
+	normalized := *record
+	normalized.GatewayIP = strings.ToLower(strings.TrimSpace(record.GatewayIP))
+	normalized.GatewayMAC = strings.ToLower(strings.TrimSpace(record.GatewayMAC))
+	normalized.LocalIP = strings.ToLower(strings.TrimSpace(record.LocalIP))
+	if normalized.GatewayIP == "" || normalized.Secret == "" || normalized.Proof == "" {
+		return nil, errors.New("gateway authorization record is incomplete")
+	}
+	if net.ParseIP(normalized.GatewayIP) == nil {
+		return nil, errors.New("gateway authorization record has an invalid address")
+	}
+	return &normalized, nil
+}
+
 func DefaultPath() (string, error) {
 	directory, err := os.UserConfigDir()
 	if err != nil {
@@ -130,6 +182,16 @@ func (s *Store) Load() (Config, error) {
 	}
 	defer unlock()
 	return s.load()
+}
+
+// ConfiguredBlockedDomains returns the persisted deny list for a device,
+// loading the current configuration from disk.
+func (s *Store) ConfiguredBlockedDomains(mac net.HardwareAddr) ([]string, error) {
+	config, err := s.Load()
+	if err != nil {
+		return nil, err
+	}
+	return config.BlockedDomains(mac), nil
 }
 
 func (s *Store) SetInterface(name string) (Config, error) {
@@ -234,6 +296,32 @@ func (s *Store) load() (Config, error) {
 	if err := validateMonitoringSettings(config.MonitoringSettings()); err != nil {
 		return Config{}, fmt.Errorf("%w: %v", ErrCorrupt, err)
 	}
+	presets, err := normalizePresets(config.Presets)
+	if err != nil {
+		return Config{}, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	config.Presets = presets
+	schedules, err := normalizeSchedules(config.Schedules, presets, false)
+	if err != nil {
+		return Config{}, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	config.Schedules = schedules
+	blocks, err := normalizeDomainBlocks(config.DomainBlocks)
+	if err != nil {
+		return Config{}, fmt.Errorf("%w: %v", ErrCorrupt, err)
+	}
+	config.DomainBlocks = blocks
+	// A malformed authorization record must never brick the configuration:
+	// it is dropped instead, which simply asks the operator to authorize
+	// the gateway again.
+	if config.GatewayAuth != nil {
+		normalized, authErr := normalizeGatewayAuth(config.GatewayAuth)
+		if authErr != nil {
+			config.GatewayAuth = nil
+		} else {
+			config.GatewayAuth = normalized
+		}
+	}
 	return clone(config), nil
 }
 
@@ -287,6 +375,22 @@ func migrate(config *Config) error {
 		config.NotifyDeviceOffline = false
 		config.NotifySuspicious = true
 		config.Version = 4
+		return nil
+	case 4:
+		// Version 5 introduces optional device automation: named presets,
+		// recurring schedules, and per-device domain block lists. Everything is
+		// optional, so a version-4 configuration simply gains empty defaults.
+		config.Presets = nil
+		config.Schedules = nil
+		config.DomainBlocks = nil
+		config.Version = 5
+		return nil
+	case 5:
+		// Version 6 introduces the gateway authorization record. Existing
+		// configurations gain no record, so the operator authorizes the
+		// gateway once on the next launch.
+		config.GatewayAuth = nil
+		config.Version = 6
 		return nil
 	default:
 		return fmt.Errorf("%w: no migration from version %d", ErrUnsupportedVersion, config.Version)
@@ -348,6 +452,13 @@ func clone(config Config) Config {
 	result.Nicknames = make(map[string]string, len(config.Nicknames))
 	for mac, nickname := range config.Nicknames {
 		result.Nicknames[mac] = nickname
+	}
+	result.Presets = clonePresets(config.Presets)
+	result.Schedules = cloneSchedules(config.Schedules)
+	result.DomainBlocks = cloneDomainBlocks(config.DomainBlocks)
+	if config.GatewayAuth != nil {
+		record := *config.GatewayAuth
+		result.GatewayAuth = &record
 	}
 	return result
 }
